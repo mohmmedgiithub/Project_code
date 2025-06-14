@@ -1,0 +1,201 @@
+
+# -*- coding: utf-8 -*-
+"""
+برنامج سحابي لفرز، بحث، وتصنيف المستندات
+تم التطوير باستخدام Python و Flask
+"""
+
+import os
+import time
+from flask import Flask, request, render_template, redirect, url_for
+from werkzeug.utils import secure_filename
+import PyPDF2
+from docx import Document
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.naive_bayes import MultinomialNB
+import boto3
+from datetime import datetime
+
+# تهيئة التطبيق
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['ALLOWED_EXTENSIONS'] = {'pdf', 'docx'}
+
+# تهيئة اتصال AWS S3 (يفضل استخدام متغيرات بيئية للأمان)
+S3_BUCKET = os.environ.get("S3_BUCKET")
+S3_ACCESS_KEY = os.environ.get("S3_ACCESS_KEY")
+S3_SECRET_KEY = os.environ.get("S3_SECRET_KEY")
+S3_REGION = "us-east-1"
+
+s3 = boto3.client(
+    's3',
+    aws_access_key_id=S3_ACCESS_KEY,
+    aws_secret_access_key=S3_SECRET_KEY,
+    region_name=S3_REGION
+)
+
+class DocumentProcessor:
+    def __init__(self):
+        self.documents = []
+        self.categories = ["تقنية", "علمية", "أدبية", "تاريخية", "طبية"]
+        self.model = None
+        self.vectorizer = None
+
+    def allowed_file(self, filename):
+        return '.' in filename and \
+               filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
+
+    def extract_text(self, file_path):
+        text = ""
+        if file_path.endswith(".pdf"):
+            with open(file_path, "rb") as file:
+                reader = PyPDF2.PdfReader(file)
+                for page in reader.pages:
+                    text += page.extract_text() or ""
+        elif file_path.endswith(".docx"):
+            doc = Document(file_path)
+            for para in doc.paragraphs:
+                text += para.text + "\n"
+        return text
+
+    def extract_title(self, file_path):
+        if file_path.endswith(".pdf"):
+            with open(file_path, "rb") as file:
+                reader = PyPDF2.PdfReader(file)
+                title = reader.metadata.title or os.path.basename(file_path)
+        elif file_path.endswith(".docx"):
+            doc = Document(file_path)
+            title = doc.paragraphs[0].text if doc.paragraphs else os.path.basename(file_path)
+        return title
+
+    def add_document(self, file_path):
+        title = self.extract_title(file_path)
+        content = self.extract_text(file_path)
+        self.documents.append({
+            "title": title,
+            "content": content,
+            "path": file_path,
+            "size": os.path.getsize(file_path),
+            "upload_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        })
+
+    def sort_documents(self, reverse=False):
+        start_time = time.time()
+        self.documents.sort(key=lambda x: x["title"], reverse=reverse)
+        return time.time() - start_time
+
+    def search_documents(self, keywords):
+        start_time = time.time()
+        results = []
+        keywords_lower = keywords.lower()
+        for doc in self.documents:
+            if keywords_lower in doc["content"].lower():
+                highlighted_content = doc["content"].replace(
+                    keywords,
+                    f"<mark>{keywords}</mark>"
+                )
+                result = doc.copy()
+                result["highlighted_content"] = highlighted_content
+                results.append(result)
+        search_time = time.time() - start_time
+        return results, search_time
+
+    def train_classifier(self):
+        if not self.documents:
+            return False
+
+        texts = [doc["content"] for doc in self.documents]
+        y = [self.categories[i % len(self.categories)] for i in range(len(texts))]
+
+        self.vectorizer = TfidfVectorizer()
+        X = self.vectorizer.fit_transform(texts)
+        self.model = MultinomialNB()
+        self.model.fit(X, y)
+        return True
+
+    def classify_documents(self):
+        if not self.model:
+            if not self.train_classifier():
+                return []
+        texts = [doc["content"] for doc in self.documents]
+        X = self.vectorizer.transform(texts)
+        return self.model.predict(X)
+
+# تهيئة المعالج
+processor = DocumentProcessor()
+
+@app.route('/')
+def index():
+    stats = {
+        "total_documents": len(processor.documents),
+        "total_size": sum(doc["size"] for doc in processor.documents) / (1024 * 1024),
+        "categories": processor.categories
+    }
+    return render_template('index.html', stats=stats, documents=processor.documents)
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    if 'file' not in request.files:
+        return redirect(request.url)
+
+    file = request.files['file']
+    if file.filename == '':
+        return redirect(request.url)
+
+    if file and processor.allowed_file(file.filename):
+        filename = secure_filename(file.filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(filepath)
+
+        try:
+            s3.upload_file(
+                filepath,
+                S3_BUCKET,
+                filename,
+                ExtraArgs={'ACL': 'public-read'}
+            )
+            processor.add_document(filepath)
+            os.remove(filepath)
+        except Exception as e:
+            return f"حدث خطأ أثناء رفع الملف: {str(e)}"
+
+        return redirect(url_for('index'))
+
+    return redirect(request.url)
+
+@app.route('/search', methods=['GET'])
+def search():
+    query = request.args.get('query', '')
+    results, search_time = processor.search_documents(query)
+    return render_template('search_results.html',
+                           results=results,
+                           query=query,
+                           search_time=f"{search_time:.4f}")
+
+@app.route('/sort', methods=['GET'])
+def sort_docs():
+    reverse = request.args.get('order', 'asc') == 'desc'
+    sort_time = processor.sort_documents(reverse)
+    return render_template('sort_results.html',
+                           sort_time=f"{sort_time:.4f}",
+                           order="تنازلي" if reverse else "تصاعدي")
+
+@app.route('/classify', methods=['GET'])
+def classify():
+    if not processor.documents:
+        return "لا توجد مستندات لتصنيفها"
+
+    classifications = processor.classify_documents()
+    classified_docs = []
+    for doc, category in zip(processor.documents, classifications):
+        doc_copy = doc.copy()
+        doc_copy["category"] = category
+        classified_docs.append(doc_copy)
+
+    return render_template('classification_results.html', documents=classified_docs)
+
+if __name__ == '__main__':
+    if not os.path.exists(app.config['UPLOAD_FOLDER']):
+        os.makedirs(app.config['UPLOAD_FOLDER'])
+
+    app.run(host='0.0.0.0', port=5000, debug=True)
